@@ -1,10 +1,11 @@
 module github.com/kdihalas/vault-action
 
-go 1.22.2
+go 1.26.0
 
 require (
 	github.com/hashicorp/vault-client-go v0.4.3
 	github.com/sethvargo/go-githubactions v1.3.2
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

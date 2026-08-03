@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"strconv"
+	"net/http"
 	"strings"
 	"time"
 
@@ -15,39 +15,32 @@ func main() {
 	ctx := context.Background()
 	githubactions.Infof("=> starting vault action")
 
-	// Read inputs
-	vaultUrl := githubactions.GetInput("url")
-	if vaultUrl == "" {
-		githubactions.Fatalf("url is required")
-	}
-	vaultRole := githubactions.GetInput("role")
-	if vaultRole == "" {
-		githubactions.Fatalf("role is required")
-	}
-	vaultJwtClaim := githubactions.GetInput("jwt_claim")
-	if vaultJwtClaim == "" {
-		githubactions.Fatalf("jwt_claim is required")
-	}
-	githubactions.Infof("=> reading the github token")
-	token, err := githubactions.GetIDToken(ctx, vaultJwtClaim)
-	if err != nil {
-		githubactions.Fatalf("Failed to get github token: %v", err)
-	}
+	// Read required inputs and fail if they're not provided
+	vaultUrl := readInputWithFail("url")
+	vaultRole := readInputWithFail("role")
+	vaultJwtClaim := readInputWithFail("jwt_claim")
+	namespace := readInput("namespace")
+	// Get the ID token for the specified claim, and fail if it cannot be obtained
+	token := readTokenWithFail(ctx, vaultJwtClaim)
 
 	githubactions.Infof("=> creating vault client")
+	httpClient := &http.Client{
+		Transport: &debugTransport{rt: http.DefaultTransport},
+	}
 	client, err := vault.New(
 		vault.WithAddress(vaultUrl),
+		vault.WithHTTPClient(httpClient),
 		vault.WithRequestTimeout(30*time.Second),
 	)
 	if err != nil {
 		githubactions.Fatalf("Failed to create vault client: %v", err)
 	}
-
-	// Read the Vault Output Token flag and convert it to boolean
-	vaultOutputToken, err := strconv.ParseBool(githubactions.GetInput("output_token"))
-	if err != nil {
-		githubactions.Fatalf("Failed to parse output_token: %v", err)
+	// Set the namespace on the client if provided
+	if namespace != "" {
+		client.SetNamespace(namespace)
 	}
+	// Read the Vault Output Token flag and convert it to boolean
+	vaultOutputToken := readBoolInputWithFail("output_token")
 
 	// Login to vault
 	resp, err := client.Auth.JwtLogin(ctx, schema.JwtLoginRequest{
@@ -64,33 +57,36 @@ func main() {
 		githubactions.AddMask(resp.Auth.ClientToken)
 	}
 
-	secrets := githubactions.GetInput("secrets")
-	if secrets == "empty" {
-		githubactions.Infof("=> no secrets to read")
-		return
+	// Helper function to parse the secrets input into lines, splitting on ';' and newlines, and trimming whitespace and trailing semicolons
+	parseLines := func(input string) []string {
+		var lines []string
+		for line := range strings.SplitSeq(input, ";\n") {
+			line = strings.TrimRight(strings.TrimSpace(line), ";")
+			if line != "" {
+				lines = append(lines, line)
+			}
+		}
+		return lines
 	}
 
-	githubactions.Infof("=> reading secrets")
-	for _, line := range strings.Split(secrets, ";\n") {
-		secret := strings.TrimRight(strings.TrimSpace(line), ";")
-		if secret == "" {
-			continue
-		}
-		secretParsed := strings.Split(secret, "|")
-		left, right := strings.TrimSpace(secretParsed[0]), strings.TrimSpace(secretParsed[1])
-		leftParsed := strings.Split(left, " ")
-		parsedPath := strings.Split(strings.TrimSpace(leftParsed[0]), "/")
-		mountPath := parsedPath[0]
-		secretPath := strings.Join(parsedPath[1:], "/")
-		key := strings.TrimSpace(leftParsed[1])
-		vaultSecret, err := client.Secrets.KvV2Read(ctx, secretPath,
-			vault.WithToken(resp.Auth.ClientToken),
-			vault.WithMountPath(mountPath),
-		)
-		if err != nil {
-			githubactions.Fatalf("Failed to read secret %s%s: %v", mountPath, secretPath, err)
-		}
-		githubactions.SetEnv(right, vaultSecret.Data.Data[key].(string))
-		githubactions.AddMask(vaultSecret.Data.Data[key].(string))
+	// Process the secrets inputs if they are provided
+	secrets := githubactions.GetInput("secrets")
+	if secrets != "empty" && secrets != "" {
+		githubactions.Infof("=> reading secrets")
+		handleKVSecrets(ctx, client, resp.Auth.ClientToken, parseLines(secrets))
+	}
+
+	// Process AWS secrets if provided
+	awsSecrets := githubactions.GetInput("aws_secrets")
+	if awsSecrets != "empty" && awsSecrets != "" {
+		githubactions.Infof("=> generating AWS dynamic credentials")
+		handleAwsSecrets(ctx, client, resp.Auth.ClientToken, parseLines(awsSecrets))
+	}
+
+	// Process Kubernetes secrets if provided
+	kubeSecrets := githubactions.GetInput("kube_secrets")
+	if kubeSecrets != "empty" && kubeSecrets != "" {
+		githubactions.Infof("=> generating Kubernetes dynamic credentials")
+		handleKubeSecrets(ctx, client, resp.Auth.ClientToken, parseLines(kubeSecrets))
 	}
 }
